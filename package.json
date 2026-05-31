@@ -1,0 +1,28 @@
+{
+  "name": "amazon-associates-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Self-hosted MCP server for Amazon Associates Italy — query earnings, clicks, and orders directly from Claude",
+  "main": "index.mjs",
+  "scripts": {
+    "setup": "node setup.mjs",
+    "start": "node index.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "amazon",
+    "associates",
+    "affiliate",
+    "claude",
+    "anthropic",
+    "model-context-protocol"
+  ],
+  "author": "Andrea Galliani <andrea.galliani.29@gmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "playwright": "^1.49.0",
+    "dotenv": "^16.4.0",
+    "zod": "^3.23.0"
+  }
+}
