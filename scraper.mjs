@@ -8,6 +8,9 @@
  */
 
 import { chromium } from 'playwright';
+import { readFileSync, existsSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import {
   getBaseUrl,
   DEFAULT_MARKETPLACE,
@@ -15,7 +18,41 @@ import {
   loadSession,
   saveSession,
   isLoginPage,
+  getSessionPath,
 } from './auth.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ─── API endpoint cache ───────────────────────────────────────────────────────
+
+/**
+ * Carica le info API scoperte durante il setup (session/api-{marketplace}.json).
+ * Se non esistono ritorna null → si usa il Playwright DOM scraping come fallback.
+ */
+function loadApiInfo(marketplace) {
+  const file = path.join(__dirname, 'session', `api-${marketplace}.json`);
+  if (!existsSync(file)) return null;
+  try { return JSON.parse(readFileSync(file, 'utf8')); }
+  catch { return null; }
+}
+
+/**
+ * Costruisce la Cookie string da un array di cookie Playwright.
+ */
+function cookiesToHeader(cookies) {
+  return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+}
+
+/**
+ * Carica i cookies dalla sessione salvata per marketplace.
+ * Ritorna un array di cookie objects, o null se non trovati.
+ */
+function loadCookiesRaw(marketplace) {
+  const file = getSessionPath(marketplace);
+  if (!existsSync(file)) return null;
+  try { return JSON.parse(readFileSync(file, 'utf8')); }
+  catch { return null; }
+}
 
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
@@ -241,16 +278,105 @@ async function extractDailyTable(page) {
   }
 }
 
+// ─── Direct HTTP fetch (no browser) ──────────────────────────────────────────
+
+/**
+ * Prova a recuperare i dati direttamente via fetch() usando i cookies salvati
+ * e gli endpoint API scoperti durante il setup.
+ *
+ * Ritorna i dati grezzi (testo o JSON) se riesce, null altrimenti.
+ */
+async function tryDirectFetch(marketplace, startDate, endDate) {
+  const cookies = loadCookiesRaw(marketplace);
+  if (!cookies) return null;
+
+  const apiInfo = loadApiInfo(marketplace);
+  if (!apiInfo || apiInfo.length === 0) return null;
+
+  const cookieHeader = cookiesToHeader(cookies);
+  const baseUrl = getBaseUrl(marketplace);
+
+  // Prova ciascun endpoint scoperto durante il setup
+  for (const endpoint of apiInfo) {
+    try {
+      // Costruisci URL con date se è un GET con query params
+      let targetUrl = endpoint.url;
+      if (endpoint.method === 'GET' && startDate) {
+        const u = new URL(targetUrl);
+        // Prova i parametri comuni usati da Amazon
+        ['startDate', 'start', 'from', 'dateFrom'].forEach(p => {
+          if (u.searchParams.has(p)) u.searchParams.set(p, startDate);
+        });
+        ['endDate', 'end', 'to', 'dateTo'].forEach(p => {
+          if (u.searchParams.has(p)) u.searchParams.set(p, endDate);
+        });
+        targetUrl = u.toString();
+      }
+
+      const headers = {
+        'cookie':        cookieHeader,
+        'accept':        endpoint.headers?.accept || 'application/json, text/html',
+        'referer':       `${baseUrl}/p/reporting/earnings`,
+        'user-agent':    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'origin':        baseUrl,
+      };
+      if (endpoint.headers?.['x-csrf-token'])        headers['x-csrf-token']        = endpoint.headers['x-csrf-token'];
+      if (endpoint.headers?.['anti-csrftoken-a2z'])  headers['anti-csrftoken-a2z']  = endpoint.headers['anti-csrftoken-a2z'];
+
+      const response = await fetch(targetUrl, {
+        method:  endpoint.method ?? 'GET',
+        headers,
+        body:    endpoint.method === 'POST' ? endpoint.postData : undefined,
+      });
+
+      if (!response.ok) continue;
+
+      const ct   = response.headers.get('content-type') ?? '';
+      const text = await response.text();
+
+      if (ct.includes('json')) {
+        return { type: 'json', data: JSON.parse(text), endpoint: targetUrl };
+      } else if (text.includes('Clicks') || text.includes('Earnings') || text.includes('click')) {
+        return { type: 'html', data: text, endpoint: targetUrl };
+      }
+    } catch { /* try next endpoint */ }
+  }
+
+  return null;
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function getEarningsSummary({ startDate, endDate, marketplace = DEFAULT_MARKETPLACE }) {
+  // 1. Prova prima via HTTP diretto (veloce, no browser)
+  const direct = await tryDirectFetch(marketplace, startDate, endDate);
+  if (direct) {
+    const metrics = direct.type === 'json'
+      ? direct.data
+      : parseReportsText(direct.data);
+    return {
+      marketplace,
+      period: { startDate, endDate },
+      metrics,
+      source: 'api',
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
+  // 2. Fallback: Playwright browser scraping
   const { browser, context } = await createSession(marketplace);
   const page = await context.newPage();
   try {
     await openReportPage(page, startDate, endDate, marketplace);
     const metrics = await extractMetrics(page);
     await saveSession(context, marketplace);
-    return { marketplace, period: { startDate, endDate }, metrics, fetchedAt: new Date().toISOString() };
+    return {
+      marketplace,
+      period: { startDate, endDate },
+      metrics,
+      source: 'scraping',
+      fetchedAt: new Date().toISOString(),
+    };
   } finally {
     await browser.close();
   }
